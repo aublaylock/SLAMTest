@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<!--
+  Served by phone_stream.py. Streams the phone's camera + IMU to the
+  laptop over one WebSocket. Requires HTTPS (iOS gates camera and motion
+  access on a secure context) and a user tap (iOS requires permission
+  requests to originate from a real gesture).
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone Stream</title>
+<style>
+  body {
+    font-family: -apple-system, sans-serif;
+    background: #111;
+    color: #eee;
+    text-align: center;
+    padding: 20px;
+  }
+  button {
+    font-size: 1.3em;
+    padding: 18px 36px;
+    border-radius: 12px;
+    border: none;
+    background: #2d7dff;
+    color: white;
+  }
+  button:disabled { background: #555; }
+  #status { margin-top: 20px; font-size: 0.95em; white-space: pre-line; text-align: left;
+            background: #000; padding: 12px; border-radius: 8px; }
+  video { display: none; }
+</style>
+</head>
+<body>
+
+<h2>Phone Stream</h2>
+<button id="startBtn">Start Streaming</button>
+<div id="status">Not started.</div>
+
+<video id="video" autoplay playsinline muted></video>
+
+<script>
+const startBtn = document.getElementById("startBtn");
+const statusEl = document.getElementById("status");
+const video = document.getElementById("video");
+
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d");
+const SEND_WIDTH = 640;
+const FRAME_INTERVAL_MS = 66; // ~15 fps
+
+let ws = null;
+let framesSent = 0;
+let framesSkipped = 0;
+let motionEventsSent = 0;
+
+function log(line) {
+  statusEl.textContent = line + "\n" + statusEl.textContent.split("\n").slice(0, 6).join("\n");
+}
+
+async function start() {
+  startBtn.disabled = true;
+
+  try {
+    if (typeof DeviceMotionEvent !== "undefined" &&
+        typeof DeviceMotionEvent.requestPermission === "function") {
+      const result = await DeviceMotionEvent.requestPermission();
+      if (result !== "granted") {
+        log("Motion permission denied - IMU fusion will not work.");
+      }
+    }
+    if (typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission === "function") {
+      await DeviceOrientationEvent.requestPermission();
+    }
+  } catch (e) {
+    log("Motion permission error: " + e);
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false,
+    });
+    video.srcObject = stream;
+  } catch (e) {
+    log("Camera error: " + e + "\n(Are you on https:// with a trusted certificate?)");
+    startBtn.disabled = false;
+    return;
+  }
+
+  ws = new WebSocket("wss://" + location.host + "/");
+  ws.onopen = () => log("Connected. Streaming...");
+  ws.onclose = () => log("Disconnected.");
+  ws.onerror = () => log("WebSocket error - check the laptop is reachable.");
+
+  // iOS Safari often returns null for e.acceleration, so we use
+  // accelerationIncludingGravity. Sent RAW, with gravity still in it:
+  // the gravity vector is an absolute drift-free "down" reference, and
+  // phone_stream.py needs it to level the attitude estimate. (OpenVINS
+  // wants raw with gravity too - it estimates gravity itself.)
+  window.addEventListener("devicemotion", (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const g = e.accelerationIncludingGravity;
+    if (!g || g.x === null) return;
+
+    const r = e.rotationRate || { alpha: 0, beta: 0, gamma: 0 };
+
+    // rotationRate alpha/beta/gamma map straight onto device x/y/z on
+    // iOS - NOT the (z, x, y) the W3C spec describes. Measured with
+    // gyro_check.py: rotating about each axis in turn, alpha tracked X,
+    // beta tracked Y and gamma tracked Z, each matching an independent
+    // accelerometer or compass reference to within a few percent.
+    // Sending them in spec order cyclically permutes the axes, which
+    // feeds yaw rate onto the pitch axis.
+    ws.send(JSON.stringify({
+      type: "motion",
+      t: Date.now(),
+      acc: [g.x || 0, g.y || 0, g.z || 0],
+      gyro: [r.alpha || 0, r.beta || 0, r.gamma || 0], // -> device x, y, z
+    }));
+    motionEventsSent++;
+  });
+
+  // webkitCompassHeading is a WebKit extension (no standard equivalent
+  // works on iOS): degrees clockwise from north, with an accuracy figure
+  // where negative means the reading is invalid / needs calibration.
+  window.addEventListener("deviceorientation", (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (e.alpha === null) return;
+    ws.send(JSON.stringify({
+      type: "orientation",
+      t: Date.now(),
+      alpha: e.alpha, beta: e.beta, gamma: e.gamma,
+      compass: typeof e.webkitCompassHeading === "number" ? e.webkitCompassHeading : null,
+      compassAcc: typeof e.webkitCompassAccuracy === "number" ? e.webkitCompassAccuracy : null,
+    }));
+  });
+
+  video.onloadedmetadata = () => {
+    const scale = SEND_WIDTH / video.videoWidth;
+    canvas.width = SEND_WIDTH;
+    canvas.height = Math.round(video.videoHeight * scale);
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      // Queued unsent data means the network can't keep up; adding more
+      // would only grow the backlog and the delay.
+      if (ws.bufferedAmount > 0) {
+        framesSkipped++;
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const captureTime = Date.now();
+      canvas.toBlob((blob) => {
+        if (blob && ws.readyState === WebSocket.OPEN) {
+          const header = new ArrayBuffer(8);
+          new DataView(header).setFloat64(0, captureTime, false);
+          ws.send(new Blob([header, blob]));
+          framesSent++;
+        }
+      }, "image/jpeg", 0.7);
+    }, FRAME_INTERVAL_MS);
+
+    setInterval(() => {
+      const buffered = ws ? ws.bufferedAmount : 0;
+      log(`frames sent: ${framesSent} (skipped: ${framesSkipped}), `
+        + `motion events: ${motionEventsSent}, ws buffered: ${buffered}B`);
+    }, 1000);
+  };
+}
+
+startBtn.addEventListener("click", start);
+</script>
+
+</body>
+</html>
